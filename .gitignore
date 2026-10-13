@@ -1,0 +1,9 @@
+# secrets : cookie de session et apikey
+.env
+
+# données locales, régénérées par le script
+price_cache.json
+price_cache.json.tmp
+wikimasters_*.csv
+*.bak
+__pycache__/
