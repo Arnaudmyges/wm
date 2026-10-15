@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 from wikimasters_discard import (
-    TOKEN_MARGIN, PriceCache, ServerError, WikiMasters,
+    CACHE_TTL, TOKEN_MARGIN, PriceCache, ServerError, WikiMasters,
     card_name, has_tag, jwt_payload, load_env, parse_supabase_cookie,
 )
 
@@ -40,7 +40,12 @@ def main():
     ap.add_argument("--max-cards", type=int, default=50,
                     help="nombre max de cartes dont le prix est demandé au serveur par exécution ; "
                          "les cartes servies par le cache ne comptent pas (défaut 50, 0 = illimité)")
+    ap.add_argument("--cache-only", action="store_true",
+                    help="ne demande aucun prix au serveur : saute les cartes absentes du cache "
+                         "(sans écrire le cache, donc compatible avec un discard qui tourne en même temps)")
     ap.add_argument("--delay", type=float, default=2.0, help="pause entre requêtes en secondes (défaut 2)")
+    ap.add_argument("--cache-ttl", type=float, default=CACHE_TTL / 3600,
+                    help="durée de validité des prix en cache, en heures (défaut 24)")
     args = ap.parse_args()
 
     tiers = sorted({float(t) for t in args.tiers.split(",") if t.strip()}, reverse=True)
@@ -73,9 +78,9 @@ def main():
         print(f"Palier >= {t:g} -> tag '{name}' ({tier_tags[t][1]})")
     print(f"Mode : {'APPLY' if args.apply else 'DRY-RUN'} | raretés {args.rarities}\n")
 
-    price_cache = PriceCache(Path(__file__).with_name("price_cache.json"))
-    print(f"Cache prix : {len(price_cache.data)} articles encore valides (< 24 h)")
-    rows, tagged, errors, fetched, from_cache = [], 0, 0, 0, 0
+    price_cache = PriceCache(Path(__file__).with_name("price_cache.json"), ttl=args.cache_ttl * 3600)
+    print(f"Cache prix : {len(price_cache.data)} articles encore valides (< {args.cache_ttl:g} h)")
+    rows, tagged, errors, fetched, from_cache, not_cached = [], 0, 0, 0, 0, 0
     capped = expiring = server_down = False
     server_errors, tag_server_errors, price_errors = 0, 0, 0
 
@@ -92,6 +97,9 @@ def main():
             r_code = card.get("rarity") or rarity
 
             summary, price_error = price_cache.get(card_id), None
+            if summary is None and args.cache_only:
+                not_cached += 1
+                continue
             if summary is None:
                 if args.max_cards and fetched >= args.max_cards:
                     capped = True
@@ -167,6 +175,8 @@ def main():
 
     n_tag = sum(r["decision"] == "tag" for r in rows)
     print(f"\n{len(rows)} cartes analysées, {fetched} articles interrogés, {from_cache} prix lus depuis le cache")
+    if args.cache_only:
+        print(f"{not_cached} cartes sautées car absentes du cache (--cache-only)")
     if capped:
         print(f"Plafond --max-cards {args.max_cards} atteint : relance plus tard pour analyser la suite.")
     print(f"{n_tag} à taguer" + (f", {tagged} tags posés" if args.apply else " (dry-run, rien modifié)"))

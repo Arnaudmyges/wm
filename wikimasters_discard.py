@@ -237,7 +237,7 @@ def has_tag(item, tag_id, tag_name):
 
 
 def card_name(card):
-    return card.get("title") or card.get("name") or card.get("label") or card.get("id", "?")
+    return card.get("wikipedia_title") or card.get("title") or card.get("name") or card.get("label") or card.get("id", "?")
 
 
 def main():
@@ -253,6 +253,8 @@ def main():
                     help="nombre max de cartes dont le prix est demandé au serveur par exécution ; "
                          "les cartes servies par le cache ne comptent pas (défaut 50, 0 = illimité)")
     ap.add_argument("--delay", type=float, default=2.0, help="pause entre requêtes en secondes (défaut 2)")
+    ap.add_argument("--cache-ttl", type=float, default=CACHE_TTL / 3600,
+                    help="durée de validité des prix en cache, en heures (défaut 24)")
     args = ap.parse_args()
 
     load_env(Path(__file__).with_name(".env"))
@@ -277,8 +279,8 @@ def main():
     print(f"Tag '{args.tag}' -> {tag_id}")
     print(f"Mode : {'APPLY' if args.apply else 'DRY-RUN'} | seuil <= {args.threshold} | raretés {args.rarities}\n")
 
-    price_cache = PriceCache(Path(__file__).with_name("price_cache.json"))
-    print(f"Cache prix : {len(price_cache.data)} articles encore valides (< 24 h)")
+    price_cache = PriceCache(Path(__file__).with_name("price_cache.json"), ttl=args.cache_ttl * 3600)
+    print(f"Cache prix : {len(price_cache.data)} articles encore valides (< {args.cache_ttl:g} h)")
     rows, tagged, errors, fetched, from_cache = [], 0, 0, 0, 0
     capped = expiring = server_down = False
     # séries d'erreurs serveur consécutives, séparées : un prix réussi ne doit pas masquer des échecs de tag
