@@ -7,3 +7,7 @@ price_cache.json.tmp
 wikimasters_*.csv
 *.bak
 __pycache__/
+
+# session renouvelée par --auto-refresh (contient le refresh_token)
+.wm_session.json
+.wm_session.tmp

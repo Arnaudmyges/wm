@@ -17,16 +17,11 @@ les deux scripts en même temps (le cache serait écrasé et la charge doublée)
 """
 import argparse
 import csv
-import os
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
-from wikimasters_discard import (
-    CACHE_TTL, TOKEN_MARGIN, PriceCache, ServerError, WikiMasters,
-    card_name, has_tag, jwt_payload, load_env, parse_supabase_cookie,
-)
+from wikimasters_discard import CACHE_TTL, PriceCache, ServerError, card_name, connect, has_tag
 
 
 def main():
@@ -34,6 +29,8 @@ def main():
     ap.add_argument("--apply", action="store_true", help="pose réellement les tags (sinon dry-run)")
     ap.add_argument("--rarities", required=True, help="raretés ciblées, ex. R,TR")
     ap.add_argument("--tiers", default="75,150,300", help="paliers de prix (défaut 75,150,300)")
+    ap.add_argument("--max-price", type=float, default=10000,
+                    help="au-delà de ce prix moyen, la carte est ignorée comme aberrante (défaut 10000, 0 = pas de plafond)")
     ap.add_argument("--tag-format", default="{seuil}+",
                     help="nom du tag pour un palier, {seuil} remplacé par sa valeur (défaut '{seuil}+')")
     ap.add_argument("--limit", type=int, default=0, help="nombre max de tags posés (0 = illimité)")
@@ -46,35 +43,21 @@ def main():
     ap.add_argument("--delay", type=float, default=2.0, help="pause entre requêtes en secondes (défaut 2)")
     ap.add_argument("--cache-ttl", type=float, default=CACHE_TTL / 3600,
                     help="durée de validité des prix en cache, en heures (défaut 24)")
+    ap.add_argument("--auto-refresh", action="store_true",
+                    help="renouvelle le token avant expiration (cookie d'une session réservée au script)")
     args = ap.parse_args()
 
     tiers = sorted({float(t) for t in args.tiers.split(",") if t.strip()}, reverse=True)
     if not tiers:
         sys.exit("--tiers vide.")
 
-    load_env(Path(__file__).with_name(".env"))
-    cookie = os.environ.get("WM_COOKIE")
-    apikey = os.environ.get("SUPABASE_APIKEY")
-    if not cookie or not apikey:
-        sys.exit("WM_COOKIE et SUPABASE_APIKEY doivent être définis dans .env")
-
-    ref, session = parse_supabase_cookie(cookie)
-    token = session["access_token"]
-    claims = jwt_payload(token)
-    user_id = claims["sub"]
-    remaining = int(claims.get("exp", 0) - time.time())
-    if remaining < 120:
-        sys.exit("Le token du cookie expire dans moins de 2 min : recharge le site et recopie le cookie.")
-    print(f"Connecté : user {user_id[:8]}..., token valide encore {remaining // 60} min")
-
-    supabase_url = os.environ.get("SUPABASE_URL") or f"https://{ref}.supabase.co"
-    wm = WikiMasters(cookie, supabase_url, apikey, token, args.delay)
+    wm = connect(args.delay, args.auto_refresh)
 
     # {seuil: (nom, id)}, du plus haut au plus bas ; find_tag_id s'arrête si un tag manque
     tier_tags = {}
     for t in tiers:
         name = args.tag_format.format(seuil=f"{t:g}")
-        tier_tags[t] = (name, wm.find_tag_id(user_id, name))
+        tier_tags[t] = (name, wm.find_tag_id(wm.auth.user_id, name))
         print(f"Palier >= {t:g} -> tag '{name}' ({tier_tags[t][1]})")
     print(f"Mode : {'APPLY' if args.apply else 'DRY-RUN'} | raretés {args.rarities}\n")
 
@@ -88,7 +71,7 @@ def main():
         if capped or expiring or server_down:
             break
         for item, _pending in wm.collection(rarity):
-            if claims.get("exp", 0) - time.time() < TOKEN_MARGIN:
+            if not wm.ensure_token():
                 expiring = True
                 break
             card = item.get("card") or {}
@@ -125,6 +108,9 @@ def main():
                 decision, reason = "error", f"erreur prix ({price_error})"
             elif price is None:
                 reason = "aucune vente"
+            elif args.max_price and price > args.max_price:
+                # moyenne faussée par une vente aberrante : pas de palier
+                decision, reason = "skip", f"prix aberrant ({price} > {args.max_price:g})"
             elif tier is None:
                 reason = f"{price} < {tiers[-1]:g}"
             elif has_tag(item, tag_id, tag_name):
@@ -187,7 +173,8 @@ def main():
         print("Erreurs serveur (5xx/404/délai dépassé) : arrêt propre. Réessaie plus tard.")
         sys.exit(3)
     if expiring:
-        print("Token bientôt expiré : arrêt propre. Recharge le site, recopie le cookie dans .env et relance.")
+        print("Token bientôt expiré (ou renouvellement refusé) : arrêt propre. "
+              "Recharge le site, recopie le cookie dans .env et relance.")
         sys.exit(2)
 
 

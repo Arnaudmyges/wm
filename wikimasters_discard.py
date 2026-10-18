@@ -11,7 +11,13 @@ Par défaut en DRY-RUN : rien n'est modifié, un CSV est produit.
   python wikimasters_discard.py --apply                 # pose réellement les tags
   python wikimasters_discard.py --max-cards 0           # analyse toute la collection
 
+  python wikimasters_discard.py --apply --auto-refresh  # renouvelle le token tout seul
+
 Les prix sont mis en cache 24 h par card_id dans price_cache.json.
+--auto-refresh renouvelle le token via le refresh_token de la session et garde
+la session renouvelée dans .wm_session.json. Le cookie doit venir d'une session
+réservée au script (fenêtre privée fermée sans se déconnecter) : un refresh_token
+ne sert qu'une fois, et Supabase déconnecte tout si le navigateur réutilise l'ancien.
 Config dans un fichier .env à côté du script (voir .env.example).
 Dépendance : pip install requests
 """
@@ -35,6 +41,10 @@ USER_AGENT = "wikimasters-discard-perso/1.0"
 CACHE_TTL = 24 * 3600  # secondes
 # arrêt propre avant expiration du token : couvre les ~3 requêtes (2 s + 20 s de timeout) possibles entre deux vérifications
 TOKEN_MARGIN = 90  # secondes
+# avec --auto-refresh : renouvellement du token quand il reste moins de 5 min
+REFRESH_MARGIN = 300  # secondes
+SESSION_FILE = ".wm_session.json"  # session renouvelée, prioritaire sur le cookie de .env si plus récente
+COOKIE_CHUNK = 3180  # taille max d'un morceau de cookie sb-...-auth-token, comme @supabase/ssr
 
 
 # ---------------------------------------------------------------- config
@@ -87,6 +97,89 @@ def jwt_payload(token: str) -> dict:
     return json.loads(base64.urlsafe_b64decode(part))
 
 
+class Auth:
+    """Session Supabase du cookie ; avec auto_refresh, renouvelle le token via le refresh_token."""
+
+    def __init__(self, cookie_str, apikey, supabase_url, session_path: Path, auto_refresh=False):
+        self.ref, self.session = parse_supabase_cookie(cookie_str)
+        self.cookie = cookie_str
+        # cookies hors session Supabase, renvoyés tels quels après renouvellement
+        self.others = [p.strip() for p in cookie_str.split(";") if "=" in p
+                       and not re.fullmatch(r"sb-[a-z0-9]+-auth-token(?:\.\d+)?", p.split("=", 1)[0].strip())]
+        self.supabase_url = (supabase_url or f"https://{self.ref}.supabase.co").rstrip("/")
+        self.apikey, self.path, self.auto_refresh = apikey, session_path, auto_refresh
+        if auto_refresh and session_path.exists():
+            try:
+                saved = json.loads(session_path.read_text(encoding="utf-8"))
+                saved_exp = jwt_payload(saved["access_token"]).get("exp", 0)
+            except (OSError, ValueError, KeyError, IndexError) as e:
+                print(f"Session {session_path.name} illisible ({e}), ignorée.")
+            else:
+                # session renouvelée par un passage précédent : gardée sauf si le cookie de .env est plus récent
+                if saved_exp > self.exp:
+                    self.session = saved
+                    self.cookie = self._build_cookie()
+
+    @property
+    def token(self):
+        return self.session["access_token"]
+
+    @property
+    def exp(self):
+        return jwt_payload(self.token).get("exp", 0)
+
+    @property
+    def remaining(self):
+        return int(self.exp - time.time())
+
+    @property
+    def user_id(self):
+        return jwt_payload(self.token)["sub"]
+
+    def _build_cookie(self):
+        raw = json.dumps(self.session, separators=(",", ":")).encode("utf-8")
+        value = "base64-" + base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        name = f"sb-{self.ref}-auth-token"
+        chunks = [value[i:i + COOKIE_CHUNK] for i in range(0, len(value), COOKIE_CHUNK)]
+        parts = ([f"{name}={chunks[0]}"] if len(chunks) == 1
+                 else [f"{name}.{i}={c}" for i, c in enumerate(chunks)])
+        return "; ".join(self.others + parts)
+
+    def _save(self):
+        tmp = self.path.with_suffix(".tmp")
+        tmp.touch(mode=0o600)  # contient le refresh_token : lisible par le seul propriétaire
+        tmp.write_text(json.dumps(self.session), encoding="utf-8")
+        tmp.replace(self.path)
+
+    def refresh(self):
+        try:
+            r = requests.post(
+                f"{self.supabase_url}/auth/v1/token", params={"grant_type": "refresh_token"},
+                json={"refresh_token": self.session["refresh_token"]},
+                headers={"apikey": self.apikey, "User-Agent": USER_AGENT}, timeout=20,
+            )
+        except requests.RequestException as e:
+            print(f"Renouvellement du token impossible : {type(e).__name__}")
+            return False
+        if r.status_code != 200:
+            # corps de réponse seulement : aucun jeton n'est affiché
+            print(f"Renouvellement du token refusé : {r.status_code} {r.text[:200]!r}")
+            return False
+        session = r.json()
+        session.setdefault("expires_at", int(time.time()) + int(session.get("expires_in", 3600)))
+        self.session = session
+        # sauvegarde immédiate : l'ancien refresh_token est désormais invalide
+        self._save()
+        self.cookie = self._build_cookie()
+        return True
+
+    def ensure_fresh(self):
+        """True si le token reste utilisable, en le renouvelant avant expiration si auto_refresh."""
+        if not self.auto_refresh:
+            return self.remaining >= TOKEN_MARGIN
+        return self.remaining >= REFRESH_MARGIN or self.refresh()
+
+
 # ---------------------------------------------------------------- cache prix
 
 class PriceCache:
@@ -122,23 +215,33 @@ class ServerError(Exception):
 
 
 class WikiMasters:
-    def __init__(self, cookie, supabase_url, apikey, access_token, delay):
-        self.delay = delay
+    def __init__(self, auth: Auth, delay):
+        self.auth, self.delay = auth, delay
         self.collection_error = None
-        self.supabase_url = supabase_url.rstrip("/")
+        self.supabase_url = auth.supabase_url
         self.site = requests.Session()
         self.site.headers.update({
-            "Cookie": cookie,
+            "Cookie": auth.cookie,
             "Accept": "application/json",
             "User-Agent": USER_AGENT,
         })
         self.supa = requests.Session()
         self.supa.headers.update({
-            "apikey": apikey,
-            "Authorization": f"Bearer {access_token}",
+            "apikey": auth.apikey,
+            "Authorization": f"Bearer {auth.token}",
             "Accept": "application/json",
             "User-Agent": USER_AGENT,
         })
+
+    def ensure_token(self):
+        """True si le token reste utilisable ; le renouvelle si besoin et met à jour les en-têtes."""
+        before = self.auth.token
+        ok = self.auth.ensure_fresh()
+        if self.auth.token != before:
+            self.site.headers["Cookie"] = self.auth.cookie
+            self.supa.headers["Authorization"] = f"Bearer {self.auth.token}"
+            print(f"Token renouvelé, valide encore {self.auth.remaining // 60} min")
+        return ok
 
     def _check(self, r: requests.Response) -> requests.Response:
         if r.status_code in (401, 403):
@@ -189,10 +292,15 @@ class WikiMasters:
 
     def find_tag_id(self, user_id, tag_name):
         time.sleep(self.delay)
-        r = self._check(self.supa.get(
-            f"{self.supabase_url}/rest/v1/tags",
-            params={"select": "*", "user_id": f"eq.{user_id}"}, timeout=20,
-        ))
+        try:
+            resp = self.supa.get(
+                f"{self.supabase_url}/rest/v1/tags",
+                params={"select": "*", "user_id": f"eq.{user_id}"}, timeout=20,
+            )
+        except (requests.Timeout, requests.ConnectionError) as e:
+            # rien n'a encore été fait : arrêt propre plutôt qu'une trace d'erreur
+            sys.exit(f"{type(e).__name__} en lisant les tags sur Supabase : réseau ou serveur indisponible, réessaie plus tard.")
+        r = self._check(resp)
         r.raise_for_status()
         tags = r.json()
         for t in tags:
@@ -236,6 +344,22 @@ def has_tag(item, tag_id, tag_name):
     return False
 
 
+def connect(delay, auto_refresh):
+    """Lit .env, ouvre la session (renouvelée si besoin et permis) et renvoie le client."""
+    load_env(Path(__file__).with_name(".env"))
+    cookie = os.environ.get("WM_COOKIE")
+    apikey = os.environ.get("SUPABASE_APIKEY")
+    if not cookie or not apikey:
+        sys.exit("WM_COOKIE et SUPABASE_APIKEY doivent être définis dans .env")
+    auth = Auth(cookie, apikey, os.environ.get("SUPABASE_URL"),
+                Path(__file__).with_name(SESSION_FILE), auto_refresh)
+    if not auth.ensure_fresh():
+        sys.exit("Le token du cookie expire dans moins de 2 min : recharge le site et recopie le cookie.")
+    print(f"Connecté : user {auth.user_id[:8]}..., token valide encore {auth.remaining // 60} min"
+          + (" (renouvellement auto)" if auto_refresh else ""))
+    return WikiMasters(auth, delay)
+
+
 def card_name(card):
     return card.get("wikipedia_title") or card.get("title") or card.get("name") or card.get("label") or card.get("id", "?")
 
@@ -255,27 +379,12 @@ def main():
     ap.add_argument("--delay", type=float, default=2.0, help="pause entre requêtes en secondes (défaut 2)")
     ap.add_argument("--cache-ttl", type=float, default=CACHE_TTL / 3600,
                     help="durée de validité des prix en cache, en heures (défaut 24)")
+    ap.add_argument("--auto-refresh", action="store_true",
+                    help="renouvelle le token avant expiration (cookie d'une session réservée au script)")
     args = ap.parse_args()
 
-    load_env(Path(__file__).with_name(".env"))
-    cookie = os.environ.get("WM_COOKIE")
-    apikey = os.environ.get("SUPABASE_APIKEY")
-    if not cookie or not apikey:
-        sys.exit("WM_COOKIE et SUPABASE_APIKEY doivent être définis dans .env")
-
-    ref, session = parse_supabase_cookie(cookie)
-    token = session["access_token"]
-    claims = jwt_payload(token)
-    user_id = claims["sub"]
-    remaining = int(claims.get("exp", 0) - time.time())
-    if remaining < 120:
-        sys.exit("Le token du cookie expire dans moins de 2 min : recharge le site et recopie le cookie.")
-    print(f"Connecté : user {user_id[:8]}..., token valide encore {remaining // 60} min")
-
-    supabase_url = os.environ.get("SUPABASE_URL") or f"https://{ref}.supabase.co"
-    wm = WikiMasters(cookie, supabase_url, apikey, token, args.delay)
-
-    tag_id = wm.find_tag_id(user_id, args.tag)
+    wm = connect(args.delay, args.auto_refresh)
+    tag_id = wm.find_tag_id(wm.auth.user_id, args.tag)
     print(f"Tag '{args.tag}' -> {tag_id}")
     print(f"Mode : {'APPLY' if args.apply else 'DRY-RUN'} | seuil <= {args.threshold} | raretés {args.rarities}\n")
 
@@ -290,7 +399,7 @@ def main():
         if capped or expiring or server_down:
             break
         for item, pending in wm.collection(rarity):
-            if claims.get("exp", 0) - time.time() < TOKEN_MARGIN:
+            if not wm.ensure_token():
                 expiring = True
                 break
             card = item.get("card") or {}
@@ -393,7 +502,8 @@ def main():
         print("Erreurs serveur (5xx/404/délai dépassé) : arrêt propre, le site ou Supabase semble saturé. Réessaie plus tard.")
         sys.exit(3)
     if expiring:
-        print("Token bientôt expiré : arrêt propre. Recharge le site, recopie le cookie dans .env et relance.")
+        print("Token bientôt expiré (ou renouvellement refusé) : arrêt propre. "
+              "Recharge le site, recopie le cookie dans .env et relance.")
         sys.exit(2)
 
 
