@@ -162,3 +162,7 @@ Chaque passage écrit un CSV dans `exports/` (séparateur `;`, s'ouvre dans Exce
 | `wikimasters_common.py` | code partagé : connexion, cache des prix, appels au site |
 | `.env` | ta configuration (secrète, non versionnée) |
 | `.wm_session.json`, `price_cache.json`, `exports/` | créés par les scripts, non versionnés |
+
+## Licence
+
+[MIT](LICENSE) : libre d'utiliser, modifier et partager, sans garantie.
