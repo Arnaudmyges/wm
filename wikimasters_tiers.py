@@ -3,51 +3,44 @@
 WikiMasters : pose un tag de palier de prix sur les cartes dont le prix moyen
 du marché atteint un seuil (par défaut 75 puis x2 jusqu'à 9600). Seul le palier
 le plus haut atteint est gardé : une carte à 200 reçoit "150+", et un ancien tag
-de palier ("75+") est retiré quand la carte passe au palier supérieur ou inférieur.
+de palier ("75+") est retiré quand la carte change de palier.
 Les autres tags ne sont jamais touchés.
 
-Par défaut en DRY-RUN : rien n'est modifié, un CSV est produit.
+Par défaut en DRY-RUN : rien n'est modifié, un CSV est produit dans exports/.
 
-  python wikimasters_tiers.py --rarities R,TR                      # dry-run, paliers 75 à 9600
+  python wikimasters_tiers.py --rarities R                         # dry-run, paliers 75 à 9600
   python wikimasters_tiers.py --rarities R --tiers 50,100,500      # autres paliers
   python wikimasters_tiers.py --rarities R --tag-format "val{seuil}"  # tags "val75", "val150"...
+  python wikimasters_tiers.py --rarities C,PC,R --cache-only       # prix du cache seulement, aucune requête de prix
   python wikimasters_tiers.py --rarities R --apply --limit 1       # test réel sur 1 carte
 
-Les tags doivent exister dans le jeu avant le lancement.
-Partage price_cache.json et .env avec wikimasters_discard.py : ne pas lancer
-les deux scripts en même temps (le cache serait écrasé et la charge doublée).
+Voir README.md pour la configuration (.env).
 """
 import argparse
-import csv
 import sys
-from datetime import datetime
-from pathlib import Path
 
-from wikimasters_discard import CACHE_TTL, PriceCache, ServerError, card_name, connect, has_tag
+from wikimasters_common import (ServerError, add_common_args, card_name, connect, has_tag,
+                                open_price_cache, write_csv)
+
+# couleurs des tags créés par --create-tags, du palier le plus bas au plus haut
+COLORS = ["#facc15", "#fb923c", "#ef4444", "#a855f7", "#6366f1", "#0ea5e9", "#14b8a6", "#22c55e"]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--apply", action="store_true", help="pose réellement les tags (sinon dry-run)")
-    ap.add_argument("--rarities", required=True, help="raretés ciblées, ex. R,TR")
+    ap.add_argument("--rarities", required=True, help="raretés ciblées, ex. C,PC,R")
     ap.add_argument("--tiers", default="75,150,300,600,1200,2400,4800,9600",
                     help="paliers de prix (défaut 75 puis x2 jusqu'à 9600)")
     ap.add_argument("--max-price", type=float, default=10000,
                     help="au-delà de ce prix moyen, la carte est ignorée comme aberrante (défaut 10000, 0 = pas de plafond)")
     ap.add_argument("--tag-format", default="{seuil}+",
                     help="nom du tag pour un palier, {seuil} remplacé par sa valeur (défaut '{seuil}+')")
-    ap.add_argument("--limit", type=int, default=0, help="nombre max de tags posés (0 = illimité)")
     ap.add_argument("--max-cards", type=int, default=50,
                     help="nombre max de cartes dont le prix est demandé au serveur par exécution ; "
                          "les cartes servies par le cache ne comptent pas (défaut 50, 0 = illimité)")
     ap.add_argument("--cache-only", action="store_true",
-                    help="ne demande aucun prix au serveur : saute les cartes absentes du cache "
-                         "(sans écrire le cache, donc compatible avec un discard qui tourne en même temps)")
-    ap.add_argument("--delay", type=float, default=2.0, help="pause entre requêtes en secondes (défaut 2)")
-    ap.add_argument("--cache-ttl", type=float, default=CACHE_TTL / 3600,
-                    help="durée de validité des prix en cache, en heures (défaut 24)")
-    ap.add_argument("--auto-refresh", action="store_true",
-                    help="renouvelle le token avant expiration (cookie d'une session réservée au script)")
+                    help="ne demande aucun prix au serveur : saute les cartes absentes du cache")
+    add_common_args(ap)
     args = ap.parse_args()
 
     tiers = sorted({float(t) for t in args.tiers.split(",") if t.strip()}, reverse=True)
@@ -56,16 +49,16 @@ def main():
 
     wm = connect(args.delay, args.auto_refresh)
 
-    # {seuil: (nom, id)}, du plus haut au plus bas ; find_tag_id s'arrête si un tag manque
+    # {seuil: (nom, id)}, du plus haut au plus bas
     tier_tags = {}
-    for t in tiers:
+    for rank, t in enumerate(sorted(tiers)):
         name = args.tag_format.format(seuil=f"{t:g}")
-        tier_tags[t] = (name, wm.find_tag_id(wm.auth.user_id, name))
-        print(f"Palier >= {t:g} -> tag '{name}' ({tier_tags[t][1]})")
+        tier_tags[t] = (name, wm.tag_id(name, create=args.create_tags, color=COLORS[rank % len(COLORS)]))
+    for t in tiers:
+        print(f"Palier >= {t:g} -> tag '{tier_tags[t][0]}' ({tier_tags[t][1]})")
     print(f"Mode : {'APPLY' if args.apply else 'DRY-RUN'} | raretés {args.rarities}\n")
 
-    price_cache = PriceCache(Path(__file__).with_name("price_cache.json"), ttl=args.cache_ttl * 3600)
-    print(f"Cache prix : {len(price_cache.data)} articles encore valides (< {args.cache_ttl:g} h)")
+    price_cache = open_price_cache(args.cache_ttl)
     rows, tagged, errors, fetched, from_cache, not_cached, removed = [], 0, 0, 0, 0, 0, 0
     capped = expiring = server_down = False
     server_errors, tag_server_errors, price_errors = 0, 0, 0
@@ -105,6 +98,7 @@ def main():
 
             tier = next((t for t in tiers if price is not None and price >= t), None)
             tag_name, tag_id = tier_tags[tier] if tier is not None else ("", None)
+            need_add, stale = False, []
 
             decision, reason = "keep", ""
             if price_error:
@@ -160,7 +154,7 @@ def main():
             print(f"[{decision:5}] {r_code:<3} {str(price):>7}  {name}  ({reason})")
 
             if errors >= 3:
-                sys.exit("3 erreurs de pose de tag : arrêt. Vérifie le payload de user_card_tags.")
+                sys.exit("3 erreurs de modification de tag : arrêt. Vérifie les droits sur user_card_tags.")
             if server_errors >= 3 or tag_server_errors >= 3:
                 server_down = True
                 break
@@ -168,11 +162,7 @@ def main():
             print(f"Erreur serveur sur la page de collection : {wm.collection_error}")
             server_down = True
 
-    out = Path(__file__).with_name(f"wikimasters_tiers_{datetime.now():%Y%m%d_%H%M%S}.csv")
-    with out.open("w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["vide"], delimiter=";")
-        w.writeheader()
-        w.writerows(rows)
+    out = write_csv(rows, "tiers")
 
     n_tag = sum(r["decision"] == "tag" for r in rows)
     print(f"\n{len(rows)} cartes analysées, {fetched} articles interrogés, {from_cache} prix lus depuis le cache")
@@ -182,15 +172,15 @@ def main():
         print(f"Plafond --max-cards {args.max_cards} atteint : relance plus tard pour analyser la suite.")
     print(f"{n_tag} à taguer" + (f", {tagged} cartes mises à jour, {removed} anciens paliers retirés"
                                  if args.apply else " (dry-run, rien modifié)"))
-    print(f"CSV : {out.name}")
+    print(f"CSV : {out.relative_to(out.parent.parent)}")
     if price_errors:
         print(f"{price_errors} carte(s) en erreur prix (5xx/404/délai), non taguées.")
     if server_down:
-        print("Erreurs serveur (5xx/404/délai dépassé) : arrêt propre. Réessaie plus tard.")
+        print("Erreurs serveur ou réseau (5xx/404/délai dépassé) : arrêt propre. Réessaie plus tard.")
         sys.exit(3)
     if expiring:
         print("Token bientôt expiré (ou renouvellement refusé) : arrêt propre. "
-              "Recharge le site, recopie le cookie dans .env et relance.")
+              "Recopie un cookie neuf dans .env et relance (voir README.md).")
         sys.exit(2)
 
 
