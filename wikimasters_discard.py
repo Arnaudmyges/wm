@@ -24,6 +24,7 @@ Dépendance : pip install requests
 import argparse
 import base64
 import csv
+import fcntl
 import json
 import os
 import re
@@ -108,17 +109,25 @@ class Auth:
                        and not re.fullmatch(r"sb-[a-z0-9]+-auth-token(?:\.\d+)?", p.split("=", 1)[0].strip())]
         self.supabase_url = (supabase_url or f"https://{self.ref}.supabase.co").rstrip("/")
         self.apikey, self.path, self.auto_refresh = apikey, session_path, auto_refresh
-        if auto_refresh and session_path.exists():
-            try:
-                saved = json.loads(session_path.read_text(encoding="utf-8"))
-                saved_exp = jwt_payload(saved["access_token"]).get("exp", 0)
-            except (OSError, ValueError, KeyError, IndexError) as e:
-                print(f"Session {session_path.name} illisible ({e}), ignorée.")
-            else:
-                # session renouvelée par un passage précédent : gardée sauf si le cookie de .env est plus récent
-                if saved_exp > self.exp:
-                    self.session = saved
-                    self.cookie = self._build_cookie()
+        if auto_refresh:
+            # session renouvelée par un passage précédent : gardée sauf si le cookie de .env est plus récent
+            self._adopt_saved()
+
+    def _adopt_saved(self):
+        """Reprend la session du fichier si son token est plus récent que le nôtre."""
+        if not self.path.exists():
+            return False
+        try:
+            saved = json.loads(self.path.read_text(encoding="utf-8"))
+            saved_exp = jwt_payload(saved["access_token"]).get("exp", 0)
+        except (OSError, ValueError, KeyError, IndexError) as e:
+            print(f"Session {self.path.name} illisible ({e}), ignorée.")
+            return False
+        if saved_exp <= self.exp:
+            return False
+        self.session = saved
+        self.cookie = self._build_cookie()
+        return True
 
     @property
     def token(self):
@@ -152,6 +161,15 @@ class Auth:
         tmp.replace(self.path)
 
     def refresh(self):
+        # verrou entre scripts lancés en parallèle : un seul renouvelle, les autres reprennent sa session,
+        # sinon le second réutiliserait un refresh_token déjà consommé et Supabase couperait la session
+        with open(self.path.with_suffix(".lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if self._adopt_saved() and self.remaining >= REFRESH_MARGIN:
+                return True
+            return self._refresh_locked()
+
+    def _refresh_locked(self):
         try:
             r = requests.post(
                 f"{self.supabase_url}/auth/v1/token", params={"grant_type": "refresh_token"},
@@ -325,6 +343,23 @@ class WikiMasters:
         if r.status_code >= 500:
             raise ServerError(f"{r.status_code} {r.text[:200]}")
         if r.status_code in (200, 201, 204, 409):  # 409 = déjà tagué
+            return True, ""
+        return False, f"{r.status_code} {r.text[:200]}"
+
+    def remove_tag(self, user_card_id, tag_id):
+        time.sleep(self.delay)
+        try:
+            resp = self.supa.delete(
+                f"{self.supabase_url}/rest/v1/user_card_tags",
+                params={"user_card_id": f"eq.{user_card_id}", "tag_id": f"eq.{tag_id}"},
+                headers={"Prefer": "return=minimal"}, timeout=20,
+            )
+        except (requests.Timeout, requests.ConnectionError) as e:
+            raise ServerError(f"{type(e).__name__} sur DELETE user_card_tags") from e
+        r = self._check(resp)
+        if r.status_code >= 500:
+            raise ServerError(f"{r.status_code} {r.text[:200]}")
+        if r.status_code in (200, 204):
             return True, ""
         return False, f"{r.status_code} {r.text[:200]}"
 

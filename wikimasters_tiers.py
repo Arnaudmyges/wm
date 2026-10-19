@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 WikiMasters : pose un tag de palier de prix sur les cartes dont le prix moyen
-du marché atteint un seuil (par défaut 75 / 150 / 300). Seul le palier le plus
-haut atteint est posé : une carte à 200 reçoit "150+", pas "75+".
+du marché atteint un seuil (par défaut 75 puis x2 jusqu'à 9600). Seul le palier
+le plus haut atteint est gardé : une carte à 200 reçoit "150+", et un ancien tag
+de palier ("75+") est retiré quand la carte passe au palier supérieur ou inférieur.
+Les autres tags ne sont jamais touchés.
 
 Par défaut en DRY-RUN : rien n'est modifié, un CSV est produit.
 
-  python wikimasters_tiers.py --rarities R,TR                      # dry-run, paliers 75,150,300
+  python wikimasters_tiers.py --rarities R,TR                      # dry-run, paliers 75 à 9600
   python wikimasters_tiers.py --rarities R --tiers 50,100,500      # autres paliers
   python wikimasters_tiers.py --rarities R --tag-format "val{seuil}"  # tags "val75", "val150"...
   python wikimasters_tiers.py --rarities R --apply --limit 1       # test réel sur 1 carte
@@ -28,7 +30,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="pose réellement les tags (sinon dry-run)")
     ap.add_argument("--rarities", required=True, help="raretés ciblées, ex. R,TR")
-    ap.add_argument("--tiers", default="75,150,300", help="paliers de prix (défaut 75,150,300)")
+    ap.add_argument("--tiers", default="75,150,300,600,1200,2400,4800,9600",
+                    help="paliers de prix (défaut 75 puis x2 jusqu'à 9600)")
     ap.add_argument("--max-price", type=float, default=10000,
                     help="au-delà de ce prix moyen, la carte est ignorée comme aberrante (défaut 10000, 0 = pas de plafond)")
     ap.add_argument("--tag-format", default="{seuil}+",
@@ -63,7 +66,7 @@ def main():
 
     price_cache = PriceCache(Path(__file__).with_name("price_cache.json"), ttl=args.cache_ttl * 3600)
     print(f"Cache prix : {len(price_cache.data)} articles encore valides (< {args.cache_ttl:g} h)")
-    rows, tagged, errors, fetched, from_cache, not_cached = [], 0, 0, 0, 0, 0
+    rows, tagged, errors, fetched, from_cache, not_cached, removed = [], 0, 0, 0, 0, 0, 0
     capped = expiring = server_down = False
     server_errors, tag_server_errors, price_errors = 0, 0, 0
 
@@ -113,17 +116,29 @@ def main():
                 decision, reason = "skip", f"prix aberrant ({price} > {args.max_price:g})"
             elif tier is None:
                 reason = f"{price} < {tiers[-1]:g}"
-            elif has_tag(item, tag_id, tag_name):
-                decision, reason = "skip", f"déjà tagué {tag_name}"
             else:
-                decision, reason = "tag", f"{price} >= {tier:g} -> {tag_name}"
+                need_add = not has_tag(item, tag_id, tag_name)
+                # anciens tags de palier de la carte, retirés pour ne garder que le bon
+                stale = [(n, i) for t, (n, i) in tier_tags.items() if t != tier and has_tag(item, i, n)]
+                if not need_add and not stale:
+                    decision, reason = "skip", f"déjà tagué {tag_name}"
+                else:
+                    decision, reason = "tag", f"{price} >= {tier:g} -> {tag_name}"
+                    if stale:
+                        reason += f", retire {', '.join(n for n, _ in stale)}"
 
             if decision == "tag" and args.apply:
                 if args.limit and tagged >= args.limit:
                     decision, reason = "keep", "limite atteinte"
                 else:
                     try:
-                        ok, err = wm.add_tag(uc_id, tag_id)
+                        # pose avant retrait : en cas d'échec, la carte garde au moins un palier
+                        ok, err = wm.add_tag(uc_id, tag_id) if need_add else (True, "")
+                        for _n, stale_id in stale if ok else []:
+                            ok, err = wm.remove_tag(uc_id, stale_id)
+                            if not ok:
+                                break
+                            removed += 1
                     except ServerError as e:
                         tag_server_errors += 1
                         decision, reason = "error", f"erreur tag ({e})"
@@ -165,7 +180,8 @@ def main():
         print(f"{not_cached} cartes sautées car absentes du cache (--cache-only)")
     if capped:
         print(f"Plafond --max-cards {args.max_cards} atteint : relance plus tard pour analyser la suite.")
-    print(f"{n_tag} à taguer" + (f", {tagged} tags posés" if args.apply else " (dry-run, rien modifié)"))
+    print(f"{n_tag} à taguer" + (f", {tagged} cartes mises à jour, {removed} anciens paliers retirés"
+                                 if args.apply else " (dry-run, rien modifié)"))
     print(f"CSV : {out.name}")
     if price_errors:
         print(f"{price_errors} carte(s) en erreur prix (5xx/404/délai), non taguées.")
