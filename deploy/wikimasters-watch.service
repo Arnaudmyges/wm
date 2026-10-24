@@ -1,0 +1,29 @@
+[Unit]
+Description=WikiMasters : tags des cartes obtenues depuis le dernier passage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/wikimasters.env
+ExecStart=/opt/wikimasters/.venv/bin/python -u /opt/wikimasters/wikimasters_watch.py --apply --auto-refresh --notify
+# même utilisateur dynamique que le passage complet : session et cache partagés
+DynamicUser=yes
+User=wikimasters
+StateDirectory=wikimasters
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=

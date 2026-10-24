@@ -3,7 +3,8 @@
 Scripts qui posent des tags sur les cartes de ta collection [WikiMasters](https://www.wiki-masters.com) selon leur prix moyen sur le marché :
 
 - **`discard`** sur les cartes qui ne valent presque rien (par défaut : moins de 15), pour les recycler ;
-- **paliers de prix** `75+`, `150+`, `300+`, `600+`, `1200+`, `2400+`, `4800+`, `9600+` sur les cartes qui valent cher. Une carte ne garde que son palier le plus haut : quand elle change de palier, l'ancien tag est retiré.
+- **paliers de prix** `75+`, `150+`, `300+`, `600+`, `1200+`, `2400+`, `4800+`, `9600+` sur les cartes qui valent cher. Une carte ne garde que son palier le plus haut : quand elle change de palier, l'ancien tag est retiré ;
+- **`jamais vendu`** sur les cartes qui n'ont encore aucune vente sur le marché. Le tag est retiré dès que la carte se vend.
 
 Ils ne font que poser et retirer ces tags. Ils ne vendent, ne recyclent et n'échangent jamais rien : c'est toi qui décides ensuite dans le jeu, en filtrant par tag.
 
@@ -13,7 +14,7 @@ Ils ne font que poser et retirer ces tags. Ils ne vendent, ne recyclent et n'éc
 
 - **Simulation par défaut** : sans `--apply`, rien n'est modifié, tu obtiens juste un rapport CSV dans `exports/`.
 - Jamais de `discard` sur les **favoris**, les **shiny** ni les cartes **en cours d'échange**.
-- Les cartes **sans aucune vente** ne sont pas taguées `discard` (option `--tag-no-sales` pour le faire).
+- Les cartes **sans aucune vente** ne sont jamais taguées `discard` : elles reçoivent `jamais vendu` à la place.
 - Un **prix moyen aberrant** (au-dessus de 10000, faussé par une vente bizarre) ne donne pas de palier.
 - Une **erreur serveur** n'est jamais prise pour « pas de vente » : la carte est sautée et réessayée au passage suivant. Après 3 erreurs d'affilée, le script s'arrête proprement.
 - Les autres tags de tes cartes ne sont jamais touchés.
@@ -82,7 +83,7 @@ Ensuite, le script garde lui-même sa session à jour dans `.wm_session.json`. T
 
 ### 5. Crée les tags
 
-Les tags `discard` et `75+` à `9600+` doivent exister dans ton compte. Le plus simple : la première fois, ajoute `--create-tags` à la commande, et ils seront créés avec des couleurs déjà choisies. Tu peux aussi les créer à la main dans le jeu.
+Les tags `discard`, `75+` à `9600+` et `jamais vendu` doivent exister dans ton compte. Le plus simple : la première fois, ajoute `--create-tags` à la commande, et ils seront créés avec des couleurs déjà choisies. Tu peux aussi les créer à la main dans le jeu.
 
 ## Utilisation
 
@@ -93,7 +94,7 @@ python run_wikimasters.py --dry-run --create-tags   # 1re fois : simulation, cr�
 python run_wikimasters.py                           # vrai passage
 ```
 
-`run_wikimasters.py` lance le `discard` puis les paliers sur les raretés C, PC et R. Il renouvelle la connexion tout seul et empêche l'ordinateur de se mettre en veille pendant le passage.
+`run_wikimasters.py` lance le `discard`, les paliers puis `jamais vendu` sur les raretés C, PC et R. Il renouvelle la connexion tout seul et empêche l'ordinateur de se mettre en veille pendant le passage.
 
 Options utiles :
 
@@ -102,7 +103,7 @@ Options utiles :
 | `--dry-run` | simulation, rien n'est modifié |
 | `--rarities R` | raretés traitées (défaut `C,PC,R`) |
 | `--threshold 5` | `discard` si le prix moyen est inférieur ou égal à 5 (défaut 14, donc moins de 15) |
-| `--only discard` / `--only tiers` | une seule des deux étapes |
+| `--only discard` / `tiers` / `no-sales` | une seule des étapes |
 | `--cache-ttl 48` | réutilise les prix de moins de 48 h au lieu de 24 h |
 | `--create-tags` | crée les tags manquants |
 
@@ -127,20 +128,65 @@ Le lanceur bloque la mise en veille automatique, mais fermer le capot met quand 
 
 ### Scripts séparés
 
-Pour un réglage plus fin, les deux scripts se lancent seuls. Ils sont en simulation tant que tu n'ajoutes pas `--apply`.
+Pour un réglage plus fin, chaque script se lance seul. Ils sont en simulation tant que tu n'ajoutes pas `--apply`.
 
 ```bash
 python wikimasters_discard.py --rarities C,PC --threshold 3 --max-cards 0
 python wikimasters_discard.py --apply --limit 1                  # vrai test sur une seule carte
 python wikimasters_tiers.py --rarities R --tiers 50,100,500      # autres paliers
 python wikimasters_tiers.py --rarities C,PC,R --cache-only       # sans redemander les prix
+python wikimasters_no_sales.py --cache-only                      # tag « jamais vendu »
 ```
 
 `--help` sur chaque script liste toutes les options. Par défaut, chaque script ne demande que 50 prix au site par exécution (`--max-cards 0` pour tout faire), et s'arrête quand le jeton de connexion expire, au bout d'une heure au plus (`--auto-refresh` pour le renouveler).
 
+## Sur un serveur : surveillance continue
+
+`wikimasters_watch.py` ne traite que les cartes obtenues depuis son dernier passage (packs, récompenses…). Chacune reçoit directement `discard`, son palier ou `jamais vendu`, avec les mêmes protections que les autres scripts. Lancé toutes les heures, il tague les nouvelles cartes peu après leur arrivée, en quelques requêtes seulement.
+
+```bash
+python wikimasters_watch.py                                   # simulation, cartes des dernières 24 h au 1er passage
+python wikimasters_watch.py --apply --auto-refresh --notify   # vrai passage, avec résumé envoyé
+```
+
+Les prix bougent : un passage complet régulier (`run_wikimasters.py`) reste utile pour mettre à jour les paliers et retirer `jamais vendu` des cartes vendues depuis. Compte environ 14 h pour 7000 cartes.
+
+### Notifications
+
+Avec `--notify`, le résumé de chaque passage part sur ntfy et/ou Discord, selon ce qui est rempli dans `.env` :
+
+```bash
+NTFY_SERVER="https://ntfy.sh"         # ou ton serveur ntfy
+NTFY_TOPIC="un-sujet-difficile-a-deviner"
+NTFY_TOKEN=""                         # si ton serveur demande une authentification
+DISCORD_WEBHOOK_URL=""                # Paramètres du salon → Intégrations → Webhooks
+```
+
+Une session expirée ou un arrêt imprévu est aussi notifié, pour que la surveillance ne s'arrête pas en silence.
+
+### Installation avec systemd
+
+Le dossier `deploy/` contient les unités :
+
+| Unité | Rôle |
+|---|---|
+| `wikimasters-watch.timer` | lance `wikimasters_watch.py` toutes les heures |
+| `wikimasters-full.timer` | lance le passage complet chaque dimanche à 1 h |
+
+```bash
+sudo mkdir -p /opt/wikimasters && sudo cp -r *.py requirements.txt deploy /opt/wikimasters/
+sudo python3 -m venv /opt/wikimasters/.venv && sudo /opt/wikimasters/.venv/bin/pip install -r /opt/wikimasters/requirements.txt
+sudo install -m 600 .env /etc/wikimasters.env    # ajoute WM_DATA_DIR=/var/lib/wikimasters
+sudo cp deploy/wikimasters-* /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo systemctl enable --now wikimasters-watch.timer wikimasters-full.timer
+journalctl -u wikimasters-watch -f                # suivre les passages
+```
+
+La session, le cache et les rapports vont dans `/var/lib/wikimasters` (`WM_DATA_DIR`). Le serveur doit avoir **sa propre session** : ne lance pas en parallèle les scripts avec `--auto-refresh` sur un autre ordinateur avec le même cookie, sinon le site vous déconnecte tous les deux.
+
 ## Rapports
 
-Chaque passage écrit un CSV dans `exports/` (séparateur `;`, s'ouvre dans Excel ou LibreOffice) : une ligne par carte avec son prix moyen, la décision (`discard`, `tag`, `keep`, `skip`, `error`) et la raison.
+Chaque passage écrit un CSV dans `exports/` (séparateur `;`, s'ouvre dans Excel ou LibreOffice) : une ligne par carte avec son prix moyen, la décision (`discard`, `tag`, `untag`, `keep`, `skip`, `error`) et la raison.
 
 ## En cas de problème
 
@@ -156,12 +202,15 @@ Chaque passage écrit un CSV dans `exports/` (séparateur `;`, s'ouvre dans Exce
 
 | Fichier | Rôle |
 |---|---|
-| `run_wikimasters.py` | lanceur : `discard` puis paliers, anti-veille |
+| `run_wikimasters.py` | lanceur : `discard`, paliers, `jamais vendu`, anti-veille |
 | `wikimasters_discard.py` | tag `discard` des cartes bon marché |
 | `wikimasters_tiers.py` | tags de palier de prix |
+| `wikimasters_no_sales.py` | tag `jamais vendu` des cartes sans vente |
+| `wikimasters_watch.py` | tags des cartes obtenues depuis le dernier passage, avec notifications |
+| `deploy/` | unités systemd pour un serveur |
 | `wikimasters_common.py` | code partagé : connexion, cache des prix, appels au site |
 | `.env` | ta configuration (secrète, non versionnée) |
-| `.wm_session.json`, `price_cache.json`, `exports/` | créés par les scripts, non versionnés |
+| `.wm_session.json`, `price_cache.json`, `watch_state.json`, `exports/` | créés par les scripts, non versionnés |
 
 ## Licence
 

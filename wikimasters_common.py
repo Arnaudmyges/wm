@@ -22,7 +22,9 @@ else:
     import fcntl
 
 BASE_DIR = Path(__file__).resolve().parent
-EXPORT_DIR = BASE_DIR / "exports"
+# fichiers créés par les scripts (session, cache, rapports) : à côté du code, ou ailleurs (ex. service systemd)
+DATA_DIR = Path(os.environ.get("WM_DATA_DIR") or BASE_DIR)
+EXPORT_DIR = DATA_DIR / "exports"
 SITE = "https://www.wiki-masters.com"
 PAGE_SIZE = 50
 USER_AGENT = "wikimasters-tools/1.0"
@@ -258,7 +260,7 @@ class PriceCache:
 
 
 def open_price_cache(ttl_hours):
-    cache = PriceCache(BASE_DIR / "price_cache.json", ttl=ttl_hours * 3600)
+    cache = PriceCache(DATA_DIR / "price_cache.json", ttl=ttl_hours * 3600)
     print(f"Cache prix : {len(cache.data)} articles encore valides (< {ttl_hours:g} h)")
     return cache
 
@@ -342,6 +344,38 @@ class WikiMasters:
                 return
             page += 1
 
+    def new_cards(self, since, rarities):
+        """Cartes obtenues après since (ISO 8601), des raretés données, de la plus ancienne à la plus récente."""
+        cards, offset = [], 0
+        while True:
+            page = self._supa_call("GET", "user_cards", "lisant les nouvelles cartes", params={
+                "select": "id,card_id,count,starred,is_shiny,obtained_at,snapshot_rarity,snapshot_title",
+                "user_id": f"eq.{self.auth.user_id}", "obtained_at": f"gt.{since}",
+                "snapshot_rarity": f"in.({','.join(rarities)})",
+                "order": "obtained_at.asc,id.asc", "limit": 1000, "offset": offset,
+            })
+            cards += page
+            if len(page) < 1000:
+                return cards
+            offset += 1000
+
+    def card_tags(self, user_card_ids):
+        """{user_card_id: [{"tag_id": ...}]} pour ces cartes."""
+        tags = {}
+        ids = list(user_card_ids)
+        for i in range(0, len(ids), 100):  # URL de taille raisonnable
+            rows = self._supa_call("GET", "user_card_tags", "lisant les tags des cartes", params={
+                "select": "user_card_id,tag_id", "user_card_id": f"in.({','.join(ids[i:i + 100])})",
+            })
+            for row in rows:
+                tags.setdefault(row["user_card_id"], []).append({"tag_id": row["tag_id"]})
+        return tags
+
+    def pending_trades(self):
+        """Ids des cartes en cours d'échange (fournis par la première page de la collection)."""
+        data = self._get_site("/api/my-collection", {"sort": "rarity", "page": 0, "stats": 0})
+        return set(data.get("pendingTradeCardIds") or [])
+
     def sales_summary(self, card_id):
         data = self._get_site(f"/api/marketplace/cards/{card_id}/sales", {"scope": "summary"})
         return (data or {}).get("summary") or {}
@@ -414,6 +448,39 @@ class WikiMasters:
         return False, f"{r.status_code} {r.text[:200]}"
 
 
+# ---------------------------------------------------------------- notifications
+
+def notify(title, body, priority=3, tags=()):
+    """Envoie un message à ntfy et/ou Discord selon .env ; une erreur d'envoi est affichée, jamais levée."""
+    server, topic = os.environ.get("NTFY_SERVER"), os.environ.get("NTFY_TOPIC")
+    if server and topic:
+        headers = {"User-Agent": USER_AGENT}
+        if os.environ.get("NTFY_TOKEN"):
+            headers["Authorization"] = f"Bearer {os.environ['NTFY_TOKEN']}"
+        try:
+            # publication JSON : titre et accents passent sans encodage d'en-tête
+            r = requests.post(server.rstrip("/"), json={
+                "topic": topic, "title": title, "message": body[:4000],
+                "priority": priority, "tags": list(tags),
+            }, headers=headers, timeout=20)
+            if r.status_code >= 300:
+                print(f"ntfy : {r.status_code} {r.text[:200]!r}")
+        except requests.RequestException as e:
+            print(f"ntfy injoignable : {type(e).__name__}")
+    webhook = os.environ.get("DISCORD_WEBHOOK_URL")
+    if webhook:
+        content = f"**{title}**\n{body}"
+        if len(content) > 2000:  # limite d'un message Discord
+            content = content[:1990] + "\n…"
+        try:
+            r = requests.post(webhook, json={"content": content, "allowed_mentions": {"parse": []}},
+                              headers={"User-Agent": USER_AGENT}, timeout=20)
+            if r.status_code >= 300:
+                print(f"Discord : {r.status_code} {r.text[:200]!r}")
+        except requests.RequestException as e:
+            print(f"Discord injoignable : {type(e).__name__}")
+
+
 # ---------------------------------------------------------------- logique
 
 def has_tag(item, tag_id, tag_name):
@@ -437,7 +504,7 @@ def connect(delay, auto_refresh):
     apikey = os.environ.get("SUPABASE_APIKEY")
     if not cookie or not apikey:
         sys.exit("WM_COOKIE et SUPABASE_APIKEY doivent être définis dans .env (voir README.md).")
-    auth = Auth(cookie, apikey, os.environ.get("SUPABASE_URL"), BASE_DIR / SESSION_FILE, auto_refresh)
+    auth = Auth(cookie, apikey, os.environ.get("SUPABASE_URL"), DATA_DIR / SESSION_FILE, auto_refresh)
     if not auth.ensure_fresh():
         if auto_refresh:
             sys.exit("Session expirée et renouvellement refusé : recopie un cookie neuf dans .env (voir README.md).")
@@ -453,7 +520,7 @@ def card_name(card):
 
 
 def add_common_args(ap):
-    """Options communes aux deux scripts."""
+    """Options communes aux scripts."""
     ap.add_argument("--apply", action="store_true", help="modifie réellement les tags (sinon dry-run)")
     ap.add_argument("--limit", type=int, default=0, help="nombre max de cartes modifiées (0 = illimité)")
     ap.add_argument("--create-tags", action="store_true", help="crée les tags manquants dans le jeu")

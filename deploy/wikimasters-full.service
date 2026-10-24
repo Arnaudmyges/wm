@@ -1,0 +1,30 @@
+[Unit]
+Description=WikiMasters : passage complet (discard, paliers, jamais vendu)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/wikimasters.env
+ExecStart=/opt/wikimasters/.venv/bin/python -u /opt/wikimasters/run_wikimasters.py --notify
+# environ 14 h pour 7000 cartes : pas de limite de durée
+TimeoutStartSec=infinity
+DynamicUser=yes
+User=wikimasters
+StateDirectory=wikimasters
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=

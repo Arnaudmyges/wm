@@ -10,6 +10,8 @@
 exports/
 price_cache.json
 price_cache.tmp
+watch_state.json
+watch_state.tmp
 wikimasters_*.csv
 *.bak
 

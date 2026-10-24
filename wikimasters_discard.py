@@ -5,6 +5,8 @@ est inférieur ou égal à un seuil (par défaut 14, donc moins de 15).
 
 Par défaut en DRY-RUN : rien n'est modifié, un CSV est produit dans exports/.
 Les favoris, les shiny et les cartes en cours d'échange ne sont jamais tagués.
+Les cartes sans aucune vente ne sont jamais taguées "discard" : c'est le rôle
+de wikimasters_no_sales.py, qui leur pose le tag "jamais vendu".
 
   python wikimasters_discard.py                          # dry-run, seuil 14, raretés C,PC,R
   python wikimasters_discard.py --threshold 3            # autre seuil
@@ -26,7 +28,6 @@ def main():
     ap.add_argument("--threshold", type=float, default=14, help="tag si prix moyen <= seuil (défaut 14)")
     ap.add_argument("--rarities", default="C,PC,R", help="raretés ciblées (défaut C,PC,R)")
     ap.add_argument("--tag", default="discard", help="nom du tag (défaut discard)")
-    ap.add_argument("--tag-no-sales", action="store_true", help="tague aussi les cartes sans aucune vente")
     ap.add_argument("--include-shiny", action="store_true", help="ne protège pas les shiny")
     ap.add_argument("--max-cards", type=int, default=50,
                     help="nombre max de cartes dont le prix est demandé au serveur par exécution ; "
@@ -91,7 +92,8 @@ def main():
             elif uc_id in pending or card_id in pending:
                 decision, reason = "skip", "échange en cours"
             elif price is None:
-                decision, reason = ("discard", "aucune vente") if args.tag_no_sales else ("keep", "aucune vente")
+                # pas de prix : géré par wikimasters_no_sales.py (tag "jamais vendu")
+                decision, reason = "keep", "aucune vente"
             elif price <= args.threshold:
                 decision, reason = "discard", f"{price} <= {args.threshold:g}"
             else:

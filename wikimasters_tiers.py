@@ -23,13 +23,14 @@ from wikimasters_common import (ServerError, add_common_args, card_name, connect
                                 open_price_cache, write_csv)
 
 # couleurs des tags créés par --create-tags, du palier le plus bas au plus haut
+DEFAULT_TIERS = "75,150,300,600,1200,2400,4800,9600"
 COLORS = ["#facc15", "#fb923c", "#ef4444", "#a855f7", "#6366f1", "#0ea5e9", "#14b8a6", "#22c55e"]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rarities", required=True, help="raretés ciblées, ex. C,PC,R")
-    ap.add_argument("--tiers", default="75,150,300,600,1200,2400,4800,9600",
+    ap.add_argument("--tiers", default=DEFAULT_TIERS,
                     help="paliers de prix (défaut 75 puis x2 jusqu'à 9600)")
     ap.add_argument("--max-price", type=float, default=10000,
                     help="au-delà de ce prix moyen, la carte est ignorée comme aberrante (défaut 10000, 0 = pas de plafond)")
